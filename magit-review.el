@@ -103,14 +103,14 @@ Works by parsing the hunk header and counting non-removed lines."
 
 (defun magit-review--format-entry (sha file line annotation)
   "Format a single review entry string."
-  (format "%s %s:%d: %s"
-          (substring sha 0 (min magit-review-sha-length (length sha)))
+  (format "%s:%d: [%s] %s"
           file
           line
+          (substring sha 0 (min magit-review-sha-length (length sha)))
           annotation))
 
 (defconst magit-review--header
-  "> Code review:\n> Annotations in the following format: <sha> <path>:<line>: Annotation\n"
+  "-*- eval: (compilation-minor-mode 1) -*-\n> Code review:\n> Annotations in the following format: <path>:<line>: [<sha>] Annotation\n"
   "Header prepended to every REVIEW.md file.")
 
 (defun magit-review--read-lines (path)
@@ -120,7 +120,8 @@ Works by parsing the hunk header and counting non-removed lines."
       (insert-file-contents path)
       (seq-filter (lambda (s)
                     (and (not (string-empty-p s))
-                         (not (string-prefix-p ">" s))))
+                         (not (string-prefix-p ">" s))
+                         (not (string-prefix-p "-*-" s))))
                   (split-string (buffer-string) "\n")))))
 
 (defun magit-review--write-sorted (path lines)
@@ -153,9 +154,8 @@ file is displayed in another window but focus remains here."
                   (user-error "Cannot determine file path")))
         (line (or (magit-review--diff-line-number)
                   (user-error "Cannot determine line number (are you on a hunk line?)"))))
-    (let* ((prompt (format "Review [%s %s:%d]: "
-                           (substring sha 0 (min magit-review-sha-length (length sha)))
-                           file line))
+    (let* ((short-sha (substring sha 0 (min magit-review-sha-length (length sha))))
+           (prompt (format "Review [%s:%d [%s]]: " file line short-sha))
            (annotation (read-string prompt)))
       (when (string-empty-p (string-trim annotation))
         (user-error "Empty annotation, aborting"))

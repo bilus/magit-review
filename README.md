@@ -5,12 +5,14 @@ Annotate diff lines while reviewing commits in magit. Annotations are saved to `
 ## Format
 
 ```
+-*- eval: (compilation-minor-mode 1) -*-
 > Code review:
-> Annotations in the following format: <sha> <path>:<line>: Annotation
+> Annotations in the following format: <path>:<line>: [<sha>] Annotation
 
-a348a942 src/main.go:57: Check error handling here
-b12cf301 pkg/server.go:12: Why not use context?
+path/to/file:123: [a348a942] My annotation
 ```
+
+Press `RET` on any annotation line to jump to the file and line.
 
 ## Installation (Doom Emacs)
 
