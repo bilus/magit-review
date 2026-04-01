@@ -1,290 +1,186 @@
-;;; magit-review.el --- Annotate magit diff hunks with git notes -*- lexical-binding: t; -*-
+;;; magit-review.el --- Annotate diff lines in magit revision buffers -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2026 Marcin Bilski
-
-;; Author: Marcin Bilski
+;; Author: Marcin
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1") (magit "3.0") (transient "0.4"))
-;; Keywords: vc, tools, convenience
-;; URL: https://github.com/bilus/magit-review
-
-;; This file is not part of GNU Emacs.
-
-;; This program is free software; you can redistribute it and/or modify
-;; it under the terms of the GNU General Public License as published by
-;; the Free Software Foundation, either version 3 of the License, or
-;; (at your option) any later version.
+;; Package-Requires: ((emacs "27.1") (magit "3.0"))
+;; Keywords: tools, vc
 
 ;;; Commentary:
 
-;; magit-review lets you annotate individual hunks in magit diff buffers
-;; using git notes.  Navigate to a hunk, press a key, type your annotation,
-;; and it gets stored as a git note on that commit in the format:
+;; Provides a single command `magit-review-annotate' that captures a
+;; one-line note about the diff line at point in a magit revision
+;; buffer.  The annotation is written to REVIEW.md in the repository
+;; root in the format:
 ;;
-;;   path/to/file:line: your annotation
+;;   a348a942 path/to/file:123: My annotation
 ;;
-;; Multiple annotations per commit are supported via `git notes append'.
-;; Notes can be exported as structured Markdown for use with LLMs.
+;; Lines in REVIEW.md are kept sorted.  The file is opened in a
+;; window but focus stays in the magit buffer so you can keep
+;; reviewing.
 
 ;;; Code:
 
 (require 'magit)
 (require 'magit-diff)
-(require 'transient)
 
 (defgroup magit-review nil
-  "Annotate magit diff hunks with git notes."
-  :group 'magit-extensions
+  "Annotate diff lines from magit revision buffers."
+  :group 'magit
   :prefix "magit-review-")
 
-(defcustom magit-review-notes-ref "refs/notes/review"
-  "Git notes ref used for review annotations.
-Using a dedicated ref keeps review notes separate from regular
-git notes in refs/notes/commits."
+(defcustom magit-review-file "REVIEW.md"
+  "File name (relative to repo root) where annotations are stored."
   :type 'string
   :group 'magit-review)
 
-(defcustom magit-review-export-file "REVIEW.md"
-  "Default filename for exported review notes."
-  :type 'string
+(defcustom magit-review-sha-length 8
+  "Number of hex characters to use for the abbreviated SHA."
+  :type 'integer
   :group 'magit-review)
 
-;;; Core
+(defun magit-review--current-sha ()
+  "Return the abbreviated commit SHA for the revision shown in the current buffer."
+  (when-let ((rev (magit-section-case
+                    (hunk  (oref (oref it parent) value))
+                    (file  (oref it value))
+                    (t     nil))))
+    ;; rev may already be the SHA if we're in a revision buffer
+    nil)
+  ;; More reliable: pull from the revision buffer directly.
+  (or (and (derived-mode-p 'magit-revision-mode)
+           magit-buffer-revision)
+      (and (derived-mode-p 'magit-diff-mode)
+           magit-buffer-range)
+      (magit-section-case
+        (hunk (when-let ((section (oref it parent)))
+                (and (derived-mode-p 'magit-revision-mode)
+                     magit-buffer-revision)))
+        (t nil))))
 
-(defun magit-review--commit-at-point ()
-  "Return the commit SHA for the current context."
-  (or (magit-commit-at-point)
-      magit-buffer-revision
-      (car magit-buffer-range)))
+(defun magit-review--diff-file ()
+  "Return the file path for the diff section at point."
+  (when-let ((section (magit-current-section)))
+    (let ((sec section))
+      ;; Walk up to the file section.
+      (while (and sec (not (magit-file-section-p sec)))
+        (setq sec (oref sec parent)))
+      (when sec
+        (oref sec value)))))
 
-(defun magit-review--hunk-line ()
-  "Return the starting line number from the hunk header at point."
-  (when (magit-section-match 'hunk)
-    (save-excursion
-      (goto-char (oref (magit-current-section) start))
-      (when (looking-at "@@[^@]+@@")
-        (let ((header (match-string 0)))
-          (when (string-match "\\+\\([0-9]+\\)" header)
-            (match-string 1 header)))))))
+(defun magit-review--diff-line-number ()
+  "Return the line number in the new file for the current diff line.
+Works by parsing the hunk header and counting non-removed lines."
+  (save-excursion
+    (beginning-of-line)
+    (let ((target-pos (point))
+          (line-num nil))
+      ;; Find the hunk header above point.
+      (when (re-search-backward "^@@" nil t)
+        ;; Parse the +N from @@ -a,b +N,M @@
+        (when (looking-at "^@@ -[0-9,]+ \\+\\([0-9]+\\)")
+          (setq line-num (1- (string-to-number (match-string 1))))
+          (forward-line 1)
+          (while (< (point) target-pos)
+            (let ((ch (char-after)))
+              (cond
+               ;; Context line or added line: increment new-file counter.
+               ((or (eq ch ?\s) (eq ch ?+))
+                (setq line-num (1+ line-num)))
+               ;; Removed line: don't count.
+               ((eq ch ?-) nil)
+               ;; Anything else (e.g. "\ No newline"): skip.
+               (t nil)))
+            (forward-line 1))
+          ;; Count the line we're actually on.
+          (let ((ch (char-after)))
+            (when (or (eq ch ?\s) (eq ch ?+))
+              (setq line-num (1+ line-num))))))
+      line-num)))
 
-(defun magit-review--hunk-text ()
-  "Return the hunk diff text at point."
-  (when (magit-section-match 'hunk)
-    (let ((section (magit-current-section)))
-      (buffer-substring-no-properties
-       (oref section start)
-       (oref section end)))))
+(defun magit-review--review-file-path ()
+  "Return the absolute path to REVIEW.md in the repo root."
+  (expand-file-name magit-review-file (magit-toplevel)))
 
-(defun magit-review--format-annotation (file line comment)
-  "Format an annotation string from FILE, LINE, and COMMENT."
-  (format "%s:%s: %s" file (or line "?") comment))
+(defun magit-review--format-entry (sha file line annotation)
+  "Format a single review entry string."
+  (format "%s %s:%d: %s"
+          (substring sha 0 (min magit-review-sha-length (length sha)))
+          file
+          line
+          annotation))
+
+(defconst magit-review--header
+  "> Code review:\n> Annotations in the following format: <sha> <path>:<line>: Annotation\n"
+  "Header prepended to every REVIEW.md file.")
+
+(defun magit-review--read-lines (path)
+  "Read PATH and return annotation lines, skipping the header."
+  (when (file-exists-p path)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (seq-filter (lambda (s)
+                    (and (not (string-empty-p s))
+                         (not (string-prefix-p ">" s))))
+                  (split-string (buffer-string) "\n")))))
+
+(defun magit-review--write-sorted (path lines)
+  "Write header followed by LINES sorted to PATH."
+  (let ((sorted (sort (copy-sequence lines) #'string<)))
+    (with-temp-file path
+      (insert magit-review--header "\n")
+      (insert (mapconcat #'identity sorted "\n") "\n"))))
+
+(defun magit-review--show-file (path)
+  "Display PATH in another window without selecting it."
+  (let ((buf (find-file-noselect path)))
+    (display-buffer buf '(display-buffer-use-some-window
+                          (inhibit-same-window . t)))
+    ;; Move to end so the latest entry is visible.
+    (with-current-buffer buf
+      (goto-char (point-max)))))
 
 ;;;###autoload
-(defun magit-review-annotate-hunk (comment)
-  "Add a file:line annotation to git notes for the commit at point.
-COMMENT is the annotation text.  The note is appended to the
-review notes ref so multiple annotations per commit are supported."
-  (interactive
-   (let* ((file (magit-file-at-point))
-          (line (magit-review--hunk-line)))
-     (unless (magit-review--commit-at-point)
-       (user-error "No commit at point"))
-     (unless file
-       (user-error "No file at point"))
-     (list (read-string (format "Note for %s:%s: " file (or line "?"))))))
-  (let* ((rev (magit-review--commit-at-point))
-         (file (magit-file-at-point))
-         (line (magit-review--hunk-line))
-         (annotation (magit-review--format-annotation file line comment)))
-    (magit-run-git "notes" "--ref" magit-review-notes-ref
-                   "append" "-m" annotation rev)
-    (message "Review note added: %s" annotation)))
-
-;;;###autoload
-(defun magit-review-show-notes ()
-  "Show review notes for the commit at point."
+(defun magit-review-annotate ()
+  "Annotate the diff line at point with a one-line comment.
+The entry is appended to REVIEW.md in the repository root.  The
+file is displayed in another window but focus remains here."
   (interactive)
-  (let ((rev (magit-review--commit-at-point)))
-    (unless rev (user-error "No commit at point"))
-    (condition-case nil
-        (let ((notes (magit-git-string "notes" "--ref" magit-review-notes-ref
-                                       "show" rev)))
-          (if notes
-              (message "%s" notes)
-            (message "No review notes for %s" (magit-rev-format "%h" rev))))
-      (error (message "No review notes for %s" (magit-rev-format "%h" rev))))))
+  (unless (derived-mode-p 'magit-revision-mode 'magit-diff-mode)
+    (user-error "Not in a magit revision/diff buffer"))
+  (let ((sha (or (magit-review--current-sha)
+                 (user-error "Cannot determine commit SHA")))
+        (file (or (magit-review--diff-file)
+                  (user-error "Cannot determine file path")))
+        (line (or (magit-review--diff-line-number)
+                  (user-error "Cannot determine line number (are you on a hunk line?)"))))
+    (let* ((prompt (format "Review [%s %s:%d]: "
+                           (substring sha 0 (min magit-review-sha-length (length sha)))
+                           file line))
+           (annotation (read-string prompt)))
+      (when (string-empty-p (string-trim annotation))
+        (user-error "Empty annotation, aborting"))
+      (let* ((path (magit-review--review-file-path))
+             (entry (magit-review--format-entry sha file line annotation))
+             (existing (magit-review--read-lines path))
+             (new-lines (append existing (list entry))))
+        (magit-review--write-sorted path new-lines)
+        (magit-review--show-file path)
+        (message "Annotated: %s" entry)))))
 
 ;;;###autoload
-(defun magit-review-remove-notes ()
-  "Remove all review notes for the commit at point."
+(defun magit-review-open ()
+  "Open REVIEW.md for the current repository."
   (interactive)
-  (let ((rev (magit-review--commit-at-point)))
-    (unless rev (user-error "No commit at point"))
-    (when (yes-or-no-p (format "Remove all review notes for %s? "
-                               (magit-rev-format "%h" rev)))
-      (magit-run-git "notes" "--ref" magit-review-notes-ref "remove" rev)
-      (message "Review notes removed for %s" (magit-rev-format "%h" rev)))))
+  (find-file (magit-review--review-file-path)))
+
+;; --- Transient integration ---
 
 ;;;###autoload
-(defun magit-review-edit-notes ()
-  "Edit review notes for the commit at point in a buffer."
-  (interactive)
-  (let ((rev (magit-review--commit-at-point)))
-    (unless rev (user-error "No commit at point"))
-    (magit-run-git-with-editor "notes" "--ref" magit-review-notes-ref
-                               "edit" rev)))
-
-;;; Export
-
-(defun magit-review--collect-notes ()
-  "Collect all review notes as an alist of (short-rev full-rev subject notes)."
-  (let ((result '())
-        (log-output (magit-git-string
-                     "log" "--all" "--format=%H"
-                     (concat "--notes=" magit-review-notes-ref))))
-    ;; Get all commits that have notes
-    (dolist (full-rev (split-string
-                       (or (magit-git-output
-                            "log" "--all" "--format=%H"
-                            (concat "--notes=" magit-review-notes-ref))
-                           "")
-                       "\n" t))
-      (condition-case nil
-          (let ((notes (magit-git-string "notes" "--ref" magit-review-notes-ref
-                                         "show" full-rev)))
-            (when (and notes (not (string-empty-p notes)))
-              (let ((short-rev (magit-rev-format "%h" full-rev))
-                    (subject (magit-rev-format "%s" full-rev)))
-                (push (list short-rev full-rev subject notes) result))))
-        (error nil)))
-    (nreverse result)))
-
-(defun magit-review--format-markdown (notes-alist)
-  "Format NOTES-ALIST as Markdown for LLM consumption."
-  (with-temp-buffer
-    (insert "# Code Review Notes\n\n")
-    (insert "## Instructions\n\n")
-    (insert "Each section below refers to a git commit. ")
-    (insert "Annotations are in the format `path/to/file:line: comment`.\n")
-    (insert "Apply the requested changes to the specified files and lines.\n\n")
-    (insert "## Annotations\n\n")
-    (dolist (entry notes-alist)
-      (let ((short-rev (nth 0 entry))
-            (full-rev (nth 1 entry))
-            (subject (nth 2 entry))
-            (notes (nth 3 entry)))
-        (insert (format "### Commit %s — %s\n\n" short-rev subject))
-        (insert "```\n")
-        (insert notes)
-        (unless (string-suffix-p "\n" notes)
-          (insert "\n"))
-        (insert "```\n\n")))
-    (buffer-string)))
-
-;;;###autoload
-(defun magit-review-export (&optional file)
-  "Export all review notes as Markdown to FILE.
-Defaults to `magit-review-export-file' in the repository root."
-  (interactive
-   (list (read-file-name "Export to: "
-                         (magit-toplevel)
-                         nil nil
-                         magit-review-export-file)))
-  (let* ((notes (magit-review--collect-notes))
-         (md (magit-review--format-markdown notes))
-         (target (or file (expand-file-name magit-review-export-file
-                                            (magit-toplevel)))))
-    (if (null notes)
-        (message "No review notes found.")
-      (with-temp-file target
-        (insert md))
-      (message "Exported %d annotated commits to %s" (length notes) target)
-      (find-file target))))
-
-;;;###autoload
-(defun magit-review-export-to-buffer ()
-  "Export all review notes as Markdown to a buffer."
-  (interactive)
-  (let* ((notes (magit-review--collect-notes))
-         (md (magit-review--format-markdown notes)))
-    (if (null notes)
-        (message "No review notes found.")
-      (let ((buf (get-buffer-create "*magit-review-export*")))
-        (with-current-buffer buf
-          (erase-buffer)
-          (insert md)
-          (markdown-mode)
-          (goto-char (point-min)))
-        (switch-to-buffer buf)))))
-
-;;;###autoload
-(defun magit-review-clear-all ()
-  "Remove all review notes from the repository.
-This deletes the entire review notes ref."
-  (interactive)
-  (when (yes-or-no-p "Remove ALL review notes from this repository? ")
-    (condition-case nil
-        (progn
-          (magit-run-git "update-ref" "-d" magit-review-notes-ref)
-          (message "All review notes cleared."))
-      (error (message "No review notes to clear.")))))
-
-;;; Transient integration
-
-(transient-define-suffix magit-review-annotate-hunk-suffix ()
-  "Add a review annotation to the hunk at point."
-  :key "n"
-  :description "Review: annotate hunk"
-  (interactive)
-  (call-interactively #'magit-review-annotate-hunk))
-
-(transient-define-suffix magit-review-show-notes-suffix ()
-  "Show review notes for commit at point."
-  :key "N"
-  :description "Review: show notes"
-  (interactive)
-  (call-interactively #'magit-review-show-notes))
-
-;;;###autoload
-(defun magit-review-setup-transient ()
-  "Add review commands to magit-diff transient."
-  (transient-append-suffix 'magit-diff "t"
-    '("n" "Review: annotate hunk" magit-review-annotate-hunk-suffix))
+(with-eval-after-load 'magit
+  (transient-append-suffix 'magit-diff "d"
+    '("n" "Annotate line" magit-review-annotate))
   (transient-append-suffix 'magit-diff "n"
-    '("N" "Review: show notes" magit-review-show-notes-suffix)))
-
-;;; Minor mode for keybindings
-
-(defvar magit-review-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c r n") #'magit-review-annotate-hunk)
-    (define-key map (kbd "C-c r s") #'magit-review-show-notes)
-    (define-key map (kbd "C-c r e") #'magit-review-edit-notes)
-    (define-key map (kbd "C-c r d") #'magit-review-remove-notes)
-    (define-key map (kbd "C-c r x") #'magit-review-export)
-    (define-key map (kbd "C-c r b") #'magit-review-export-to-buffer)
-    map)
-  "Keymap for `magit-review-mode'.")
-
-;;;###autoload
-(define-minor-mode magit-review-mode
-  "Minor mode for annotating magit diffs with review notes."
-  :lighter " Rev"
-  :keymap magit-review-mode-map
-  :group 'magit-review)
-
-;;;###autoload
-(defun magit-review-enable ()
-  "Enable magit-review in magit diff and revision buffers."
-  (magit-review-mode 1))
-
-;;;###autoload
-(defun magit-review-setup ()
-  "Set up magit-review: hooks and transient integration."
-  (interactive)
-  (add-hook 'magit-diff-mode-hook #'magit-review-enable)
-  (add-hook 'magit-revision-mode-hook #'magit-review-enable)
-  (magit-review-setup-transient))
+    '("N" "Open review file" magit-review-open)))
 
 (provide 'magit-review)
 ;;; magit-review.el ends here
