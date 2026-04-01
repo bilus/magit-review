@@ -110,7 +110,7 @@ Works by parsing the hunk header and counting non-removed lines."
           annotation))
 
 (defconst magit-review--header
-  "-*- eval: (compilation-minor-mode 1) -*-\n> Code review:\n> Annotations in the following format: <path>:<line>: [<sha>] Annotation\n"
+  "> Code review:\n> Annotations in the following format: <path>:<line>: [<sha>] Annotation\n> C-c on a line to go to it (on HEAD)\n"
   "Header prepended to every REVIEW.md file.")
 
 (defun magit-review--read-lines (path)

@@ -5,9 +5,9 @@ Annotate diff lines while reviewing commits in magit. Annotations are saved to `
 ## Format
 
 ```
--*- eval: (compilation-minor-mode 1) -*-
 > Code review:
 > Annotations in the following format: <path>:<line>: [<sha>] Annotation
+> C-c on a line to go to it (on HEAD)
 
 path/to/file:123: [a348a942] My annotation
 ```
