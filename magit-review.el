@@ -40,22 +40,31 @@
 
 (defun magit-review--current-sha ()
   "Return the abbreviated commit SHA for the revision shown in the current buffer."
-  (when-let ((rev (magit-section-case
-                    (hunk  (oref (oref it parent) value))
-                    (file  (oref it value))
-                    (t     nil))))
-    ;; rev may already be the SHA if we're in a revision buffer
-    nil)
-  ;; More reliable: pull from the revision buffer directly.
   (or (and (derived-mode-p 'magit-revision-mode)
            magit-buffer-revision)
       (and (derived-mode-p 'magit-diff-mode)
-           magit-buffer-range)
-      (magit-section-case
-        (hunk (when-let ((section (oref it parent)))
-                (and (derived-mode-p 'magit-revision-mode)
-                     magit-buffer-revision)))
-        (t nil))))
+           magit-buffer-range)))
+
+(defun magit-review--head-sha ()
+  "Return the current HEAD commit SHA, or nil if unavailable."
+  (magit-rev-parse "HEAD"))
+
+(defun magit-review--section-kind ()
+  "Return the kind of the current diff section.
+Returns one of: \\='committed, \\='staged, \\='unstaged, or nil."
+  (cond
+   ((derived-mode-p 'magit-revision-mode) 'committed)
+   ((derived-mode-p 'magit-diff-mode) 'committed)
+   ((derived-mode-p 'magit-status-mode)
+    (let ((sec (magit-current-section)))
+      (catch 'found
+        (while sec
+          (let ((type (oref sec type)))
+            (cond
+             ((eq type 'staged)   (throw 'found 'staged))
+             ((eq type 'unstaged) (throw 'found 'unstaged)))
+            (setq sec (oref sec parent))))
+        nil)))))
 
 (defun magit-review--diff-file ()
   "Return the file path for the diff section at point."
@@ -113,23 +122,52 @@ Works by parsing the hunk header and counting non-removed lines."
   "> Code review:\n> Annotations in the following format: <path>:<line>: [<sha>] Annotation\n> C-c on a line to go to it (on HEAD)\n"
   "Header prepended to every REVIEW.md file.")
 
-(defun magit-review--read-lines (path)
-  "Read PATH and return annotation lines, skipping the header."
-  (when (file-exists-p path)
-    (with-temp-buffer
-      (insert-file-contents path)
-      (seq-filter (lambda (s)
-                    (and (not (string-empty-p s))
-                         (not (string-prefix-p ">" s))
-                         (not (string-prefix-p "-*-" s))))
-                  (split-string (buffer-string) "\n")))))
+(defconst magit-review--section-titles
+  '((committed . "## Committed")
+    (staged    . "## Staged (uncommitted; SHA is HEAD at time of annotation)")
+    (unstaged  . "## Unstaged (uncommitted; SHA is HEAD at time of annotation)"))
+  "Section headings written to REVIEW.md, in order.")
 
-(defun magit-review--write-sorted (path lines)
-  "Write header followed by LINES sorted to PATH."
-  (let ((sorted (sort (copy-sequence lines) #'string<)))
-    (with-temp-file path
-      (insert magit-review--header "\n")
-      (insert (mapconcat #'identity sorted "\n") "\n"))))
+(defun magit-review--read-sections (path)
+  "Read PATH and return an alist of (KIND . LINES).
+KIND is one of committed/staged/unstaged."
+  (let ((result (mapcar (lambda (cell) (cons (car cell) nil))
+                        magit-review--section-titles)))
+    (when (file-exists-p path)
+      (with-temp-buffer
+        (insert-file-contents path)
+        (let ((current 'committed))
+          (dolist (raw (split-string (buffer-string) "\n"))
+            (cond
+             ((string-empty-p raw) nil)
+             ((string-prefix-p ">" raw) nil)
+             ((string-prefix-p "-*-" raw) nil)
+             ((string-prefix-p "##" raw)
+              (let ((match (seq-find
+                            (lambda (cell)
+                              (string= (string-trim raw) (cdr cell)))
+                            magit-review--section-titles)))
+                (when match (setq current (car match)))))
+             (t
+              (let ((cell (assq current result)))
+                (setcdr cell (cons raw (cdr cell))))))))))
+    (dolist (cell result)
+      (setcdr cell (nreverse (cdr cell))))
+    result))
+
+(defun magit-review--write-sections (path sections)
+  "Write header and SECTIONS (alist of KIND . LINES) to PATH."
+  (with-temp-file path
+    (insert magit-review--header "\n")
+    (dolist (cell magit-review--section-titles)
+      (let* ((kind (car cell))
+             (title (cdr cell))
+             (lines (cdr (assq kind sections)))
+             (sorted (sort (copy-sequence lines) #'string<)))
+        (insert title "\n\n")
+        (when sorted
+          (insert (mapconcat #'identity sorted "\n") "\n"))
+        (insert "\n")))))
 
 (defun magit-review--show-file (path)
   "Display PATH in another window without selecting it."
@@ -146,26 +184,31 @@ Works by parsing the hunk header and counting non-removed lines."
 The entry is appended to REVIEW.md in the repository root.  The
 file is displayed in another window but focus remains here."
   (interactive)
-  (unless (derived-mode-p 'magit-revision-mode 'magit-diff-mode)
-    (user-error "Not in a magit revision/diff buffer"))
-  (let ((sha (or (magit-review--current-sha)
-                 (user-error "Cannot determine commit SHA")))
-        (file (or (magit-review--diff-file)
-                  (user-error "Cannot determine file path")))
-        (line (or (magit-review--diff-line-number)
-                  (user-error "Cannot determine line number (are you on a hunk line?)"))))
+  (unless (derived-mode-p 'magit-revision-mode 'magit-diff-mode 'magit-status-mode)
+    (user-error "Not in a magit revision/diff/status buffer"))
+  (let* ((kind (or (magit-review--section-kind)
+                   (user-error "Point is not in a committed/staged/unstaged diff section")))
+         (sha (or (if (eq kind 'committed)
+                      (magit-review--current-sha)
+                    (magit-review--head-sha))
+                  (user-error "Cannot determine SHA")))
+         (file (or (magit-review--diff-file)
+                   (user-error "Cannot determine file path")))
+         (line (or (magit-review--diff-line-number)
+                   (user-error "Cannot determine line number (are you on a hunk line?)"))))
     (let* ((short-sha (substring sha 0 (min magit-review-sha-length (length sha))))
-           (prompt (format "Review [%s:%d [%s]]: " file line short-sha))
+           (prompt (format "Review [%s] [%s:%d [%s]]: " kind file line short-sha))
            (annotation (read-string prompt)))
       (when (string-empty-p (string-trim annotation))
         (user-error "Empty annotation, aborting"))
       (let* ((path (magit-review--review-file-path))
              (entry (magit-review--format-entry sha file line annotation))
-             (existing (magit-review--read-lines path))
-             (new-lines (append existing (list entry))))
-        (magit-review--write-sorted path new-lines)
+             (sections (magit-review--read-sections path))
+             (cell (assq kind sections)))
+        (setcdr cell (append (cdr cell) (list entry)))
+        (magit-review--write-sections path sections)
         (magit-review--show-file path)
-        (message "Annotated: %s" entry)))))
+        (message "Annotated [%s]: %s" kind entry)))))
 
 ;;;###autoload
 (defun magit-review-open ()
